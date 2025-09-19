@@ -2081,3 +2081,28 @@ ORDER BY polarization_score DESC, title DESC
 GROUP BY uwc1.category, uwc2.category
   HAVING COUNT(1) > 2
 ORDER BY customer_count DESC, category1, category2
+
+
+/* Find Zombie Sessions */
+  SELECT session_id, user_id,
+         EXTRACT(EPOCH FROM (MAX(event_timestamp) - MIN(event_timestamp))) / 60 session_duration_minutes,
+         COUNT(CASE WHEN event_type = 'scroll' THEN 1 END) scroll_count
+    FROM app_events
+GROUP BY session_id, user_id
+  HAVING EXTRACT(EPOCH FROM (MAX(event_timestamp) - MIN(event_timestamp))) / 60 > 30
+         AND COUNT(CASE WHEN event_type = 'scroll' THEN 1 END) >= 5
+         AND ROUND(COUNT(CASE WHEN event_type = 'click' THEN 1 END)::numeric /
+                   COUNT(CASE WHEN event_type = 'scroll' THEN 1 END), 2) < 0.20
+         AND COUNT(CASE WHEN event_type = 'purchase' THEN 1 END) = 0
+ORDER BY scroll_count DESC, session_id
+
+
+/* Find Loyal Customers */
+  SELECT customer_id
+    FROM customer_transactions
+GROUP BY customer_id
+  HAVING COUNT(CASE WHEN transaction_type = 'purchase' THEN 1 END) >= 3
+         AND MAX(transaction_date) - MIN(transaction_date) >= 30
+         AND 1.0 * COUNT(CASE WHEN transaction_type = 'refund' THEN 1 END) /
+             COUNT(1) < 0.2
+ORDER BY customer_id
