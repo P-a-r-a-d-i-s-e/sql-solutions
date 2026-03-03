@@ -2304,3 +2304,20 @@ ORDER BY reaction_ratio DESC, user_id
    WHERE total_reactions >= 5
          AND reaction_ratio >= 0.6
 ORDER BY reaction_ratio DESC, user_id
+
+
+/* Most Common Course Pairs */
+    WITH pathways AS
+         (SELECT course_name first_course,
+                 COUNT(course_id) OVER (PARTITION BY user_id) courses_cnt,
+                 AVG(course_rating) OVER (PARTITION BY user_id) avg_rating,
+                 LEAD(course_name) OVER(PARTITION BY user_id ORDER BY completion_date) second_course
+            FROM course_completions
+         )
+  SELECT first_course, second_course, COUNT(1) transition_count
+    FROM pathways
+   WHERE courses_cnt >= 5
+         AND avg_rating >= 4
+         AND second_course IS NOT NULL
+GROUP BY first_course, second_course
+ORDER BY transition_count DESC, LOWER(first_course), LOWER(second_course)
