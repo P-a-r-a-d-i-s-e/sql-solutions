@@ -2106,3 +2106,201 @@ GROUP BY customer_id
          AND 1.0 * COUNT(CASE WHEN transaction_type = 'refund' THEN 1 END) /
              COUNT(1) < 0.2
 ORDER BY customer_id
+
+
+/* Analyze Organization Hierarchy */
+    WITH RECURSIVE hierarchy AS
+         (SELECT employee_id, employee_name, 1 level, salary, ARRAY[employee_id] path
+            FROM Employees
+           WHERE manager_id IS NULL
+
+           UNION ALL
+
+          SELECT e.employee_id, e.employee_name, 1 + h.level, e.salary,
+                 array_append(h.path, e.employee_id)
+            FROM Employees e
+                 JOIN hierarchy h
+                 ON e.manager_id = h.employee_id
+         )
+  SELECT h1.employee_id, h1.employee_name, h1.level,
+         COUNT(*) FILTER(WHERE h1.employee_id != h2.employee_id) team_size,
+         SUM(h2.salary) budget
+    FROM hierarchy h1
+         LEFT JOIN hierarchy h2
+         ON h1.employee_id = ANY(h2.path)
+GROUP BY h1.employee_id, h1.employee_name, h1.level
+ORDER BY h1.level, budget DESC, employee_name
+
+-- Another solution
+    WITH RECURSIVE CTE AS
+         (SELECT employee_id, manager_id, employee_name, salary, 1 AS level
+            FROM Employees
+           WHERE manager_id IS NULL
+
+           UNION ALL
+
+          SELECT E.employee_id, E.manager_id, E.employee_name, E.salary, level + 1 AS level
+            FROM Employees E, CTE C
+           WHERE E.manager_id = C.employee_id
+         ),
+         CTE2 AS
+         (SELECT DISTINCT C.employee_id, C.employee_name, C.level,
+                 COUNT(E.employee_id) OVER(PARTITION BY C.employee_id) team_size,
+                 COALESCE(SUM(E.salary) OVER(PARTITION BY C.employee_id), 0) + C.salary AS budget
+            FROM CTE C
+                 LEFT JOIN LATERAL (  WITH RECURSIVE CTE1 AS
+                                           (SELECT employee_id, manager_id, salary
+                                              FROM Employees E
+                                             WHERE E.manager_id = C.employee_id
+
+                                             UNION ALL
+
+                                            SELECT EE.employee_id, EE.manager_id, EE.salary
+                                              FROM CTE1 CC, Employees EE
+                                             WHERE EE.manager_id = CC.employee_id
+                                           )
+                                    SELECT * FROM CTE1
+                                   ) E
+                 ON 1 = 1
+         )
+  SELECT *
+    FROM CTE2
+ORDER BY level, budget DESC, employee_name
+
+
+/* Find Golden Hour Customers */
+    WITH orders_in_peak_hours (customer_id, orders_count) AS
+         ( SELECT customer_id,
+                  COUNT(order_id)
+             FROM restaurant_orders
+            WHERE (order_timestamp::time BETWEEN '11:00:00' AND '14:00:00')
+                  OR (order_timestamp::time BETWEEN '18:00:00' AND '21:00:00')
+         GROUP BY customer_id
+         )
+
+  SELECT ro.customer_id,
+         COUNT(ro.order_id) total_orders,
+         CEIL((100.0 * oiph.orders_count) / COUNT(ro.order_id)) peak_hour_percentage,
+         ROUND(AVG(ro.order_rating), 2 ) average_rating
+    FROM restaurant_orders ro
+         JOIN orders_in_peak_hours oiph
+         ON ro.customer_id = oiph.customer_id
+GROUP BY ro.customer_id, oiph.orders_count
+  HAVING COUNT(ro.order_id) >= 3
+         AND (100.0 * oiph.orders_count) / COUNT(ro.order_id) >= 60
+         AND ROUND(AVG(ro.order_rating), 2 ) >= 4.0
+         AND (100.0 * COUNT(ro.order_rating)) / COUNT(ro.order_id) >= 50
+ORDER BY average_rating DESC, ro.customer_id DESC
+
+-- Another solution
+  SELECT customer_id,
+         COUNT(*) total_orders,
+         CEIL((100.0 * SUM(CASE
+                             WHEN order_timestamp::time BETWEEN '11:00' AND '14:00'
+                                  OR order_timestamp::time BETWEEN '18:00' AND '21:00'
+                             THEN 1 ELSE 0
+                             END)) / COUNT(*)) peak_hour_percentage,
+         ROUND(AVG(order_rating), 2) average_rating
+    FROM restaurant_orders
+GROUP BY customer_id
+  HAVING COUNT(*) >= 3
+         AND (100.0 * SUM(CASE
+                            WHEN order_timestamp::time BETWEEN '11:00' AND '14:00'
+                                 OR order_timestamp::time BETWEEN '18:00' AND '21:00'
+                            THEN 1 ELSE 0
+                          END)) / COUNT(*) >= 60
+         AND ROUND(AVG(order_rating), 2) >= 4
+         AND (100.0 * COUNT(order_rating)) / COUNT(*) >= 50
+ORDER BY average_rating DESC, customer_id DESC
+
+
+/* Find Churn Risk Customers */
+  SELECT q2.user_id,
+         q1.current_plan,
+         q1.current_monthly_amount,
+         q1.max_historical_amount,
+         q2.days_as_subscriber
+    FROM (SELECT DISTINCT
+                 user_id,
+                 first_value(plan_name) OVER (PARTITION BY user_id ORDER BY event_date DESC) current_plan,
+                 100.0 * first_value(monthly_amount) OVER (PARTITION BY user_id ORDER BY event_date DESC) /
+                 MAX(monthly_amount) OVER (PARTITION BY user_id) current_plan_revenue,
+                 MAX(monthly_amount) OVER (PARTITION BY user_id) max_historical_amount,
+                 first_value(event_type) OVER (PARTITION BY user_id ORDER BY event_date DESC, event_id DESC) last_event,
+                 first_value(monthly_amount) OVER (PARTITION BY user_id ORDER BY event_date DESC) current_monthly_amount
+            FROM subscription_events se
+         ) q1
+         JOIN (  SELECT user_id,
+                        MAX(event_date) - MIN(event_date) days_as_subscriber
+                   FROM subscription_events se1
+                  WHERE EXISTS (SELECT 1
+                                  FROM subscription_events se2
+                                 WHERE event_type = 'downgrade'
+                                       AND se1.user_id = se2.user_id
+                               )
+               GROUP BY user_id
+                 HAVING MAX(event_date) - MIN(event_date) >= 60
+              ) q2
+         ON q1.user_id = q2.user_id
+            AND q1.last_event <> 'cancel'
+            AND q1.current_plan_revenue < 50
+ORDER BY days_as_subscriber DESC, user_id
+
+-- Another solution
+    WITH user_summary AS
+         (SELECT user_id,
+                 last_value(plan_name) OVER (PARTITION BY user_id ORDER BY event_date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) current_plan,
+                 last_value(monthly_amount) OVER (PARTITION BY user_id ORDER BY event_date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) current_monthly_amount,
+                 MAX(monthly_amount) OVER (PARTITION BY user_id) max_historical_amount,
+                 (MAX(event_date) OVER (PARTITION BY user_id) - MIN(event_date) OVER (PARTITION BY user_id)) days_as_subscriber,
+                 SUM(CASE WHEN event_type = 'downgrade' THEN 1 ELSE 0 END) OVER (PARTITION BY user_id) downgrade_count,
+                 last_value(event_type) OVER (PARTITION BY user_id ORDER BY event_date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) last_event_type
+            FROM subscription_events
+         )
+
+  SELECT DISTINCT
+         user_id,
+         current_plan,
+         current_monthly_amount,
+         max_historical_amount,
+         days_as_subscriber
+    FROM user_summary
+   WHERE last_event_type <> 'cancel'
+         AND downgrade_count >= 1
+         AND current_monthly_amount < 0.5 * max_historical_amount
+         AND days_as_subscriber >= 60
+ORDER BY days_as_subscriber DESC, user_id ASC;
+
+
+/* Find Emotionally Consistent Users */
+  SELECT user_id,
+         FIRST_VALUE(reaction) OVER (PARTITION BY user_id) dominant_reaction,
+         FIRST_VALUE(reaction_ratio) OVER (PARTITION BY user_id) reaction_ratio
+    FROM (  SELECT DISTINCT user_id, reaction,
+                   COUNT(content_id) OVER (PARTITION BY user_id) total_reactions,
+                   COUNT(reaction) OVER (PARTITION BY user_id, reaction) reaction_categories_count,
+                   ROUND(COUNT(reaction) OVER (PARTITION BY user_id, reaction)::numeric /
+                         COUNT(content_id) OVER (PARTITION BY user_id), 2) reaction_ratio
+              FROM reactions
+          ORDER BY user_id, reaction_categories_count DESC
+         ) q
+   WHERE total_reactions >= 5
+         AND reaction_ratio >= 0.6
+ORDER BY reaction_ratio DESC, user_id
+
+-- Another solution
+  SELECT user_id,
+         reaction dominant_reaction,
+         reaction_ratio
+    FROM (  SELECT DISTINCT ON(user_id)
+                   user_id, reaction,
+                   COUNT(content_id) OVER (PARTITION BY user_id) total_reactions,
+                   COUNT(reaction) OVER (PARTITION BY user_id, reaction) reaction_categories_count,
+                   ROUND(COUNT(reaction) OVER (PARTITION BY user_id, reaction)::numeric /
+                         COUNT(content_id) OVER (PARTITION BY user_id), 2) reaction_ratio
+              FROM reactions
+          ORDER BY user_id, reaction_categories_count DESC
+         ) q
+   WHERE total_reactions >= 5
+         AND reaction_ratio >= 0.6
+ORDER BY reaction_ratio DESC, user_id
